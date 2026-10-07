@@ -109,9 +109,14 @@
     'use strict';
     var DEBUG = false;
     var SHAKA = 'pinned';
-    var BUILD = 'cnx-receiver-1.1.3';
+    var BUILD = 'cnx-receiver-1.1.4';
     var NS = 'urn:x-cast:com.cnxplayer.cast';
     var inError = false;
+    var ERROR_HOLD_MS = 30000;
+    var heldError = null;
+    var errorHold = null;
+    var playedSinceLoad = false;
+    var retryLoad = false;
     var shakaVer = '';
     var shakaProbe = 'not-probed';
     function readShakaVer() {
@@ -287,12 +292,31 @@
     on(context, SYS.EventType.SENDER_CONNECTED, updatePill, 'SENDER_CONNECTED');
     on(context, SYS.EventType.SENDER_DISCONNECTED, function () { updatePill(); }, 'SENDER_DISCONNECTED');
 
+    function clearHeldError() {
+      if (errorHold) { try { clearTimeout(errorHold); } catch (e) {} errorHold = null; }
+      heldError = null;
+    }
+    function showError(code) {
+      clearHeldError();
+      inError = true;
+      document.getElementById('errMsg').textContent = 'This media could not be played on this device.';
+      try {
+        var hintEl = document.getElementById('errHint');
+        if (hintEl) hintEl.textContent = 'Cast again from the app to retry.' + (code != null ? ' (code ' + code + ')' : '');
+      } catch (e2) {}
+      showScreen('error');
+    }
+
     pm.setMessageInterceptor(M.MessageType.LOAD, function (req) {
       inError = false;
+      retryLoad = !!heldError;
+      playedSinceLoad = false;
+      clearHeldError();
       showScreen('loading');
       if (loadWatchdog) { try { clearTimeout(loadWatchdog); } catch (e) {} }
       loadWatchdog = setTimeout(function () {
         loadWatchdog = null;
+        if (heldError) return;
         dlog('LOAD watchdog: 60s on the loading screen with no state change → idle');
         showScreen('idle');
       }, 60000);
@@ -326,22 +350,26 @@
     }, 'PLAYER_LOAD_COMPLETE');
     on(pm, E.MEDIA_STATUS, function () {
       var st = ''; try { st = pm.getPlayerState(); } catch (e) {}
-      if (st === 'PLAYING' || st === 'PAUSED') { inError = false; showScreen('none'); }
-      else if (st === 'IDLE') { if (!inError) showScreen('idle'); }
+      if (st === 'PLAYING' || st === 'PAUSED') { inError = false; playedSinceLoad = true; clearHeldError(); showScreen('none'); }
+      else if (st === 'IDLE') { if (!inError && !heldError) showScreen('idle'); }
     }, 'MEDIA_STATUS');
-    on(pm, E.MEDIA_FINISHED, function () { dlog('MEDIA_FINISHED'); if (!inError) showScreen('idle'); }, 'MEDIA_FINISHED');
+    on(pm, E.MEDIA_FINISHED, function () { dlog('MEDIA_FINISHED'); if (!inError && !heldError) showScreen('idle'); }, 'MEDIA_FINISHED');
     on(pm, E.ERROR, function (e) {
       var code = e.detailedErrorCode;
       dlog('ERROR code=' + code + ' reason=' + (e.error && (e.error.reason || e.error.type) || '?'));
       if (code === 904) return;
-      inError = true;
-      document.getElementById('errMsg').textContent = 'This media could not be played on this device.';
-      try {
-        var hintEl = document.getElementById('errHint');
-        if (hintEl) hintEl.textContent = 'Cast again from the app to retry.' + (code != null ? ' (code ' + code + ')' : '');
-      } catch (e2) {}
-      showScreen('error');
       toSenders({ type: 'error', detailedErrorCode: code, reason: e.error && (e.error.reason || e.error.type) });
+      if (playedSinceLoad || retryLoad) { showError(code); return; }
+      clearHeldError();
+      heldError = { code: code };
+      showScreen('loading');
+      errorHold = setTimeout(function () {
+        errorHold = null;
+        var held = heldError;
+        if (!held) return;
+        dlog('ERROR hold: no new LOAD within ' + (ERROR_HOLD_MS / 1000) + 's → error screen');
+        showError(held.code);
+      }, ERROR_HOLD_MS);
     }, 'ERROR');
 
     function probeCaps() {
