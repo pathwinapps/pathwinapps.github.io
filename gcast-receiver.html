@@ -109,7 +109,7 @@
     'use strict';
     var DEBUG = false;
     var SHAKA = 'pinned';
-    var BUILD = 'cnx-receiver-1.1.4';
+    var BUILD = 'cnx-receiver-1.1.5';
     var NS = 'urn:x-cast:com.cnxplayer.cast';
     var inError = false;
     var ERROR_HOLD_MS = 30000;
@@ -117,6 +117,11 @@
     var errorHold = null;
     var playedSinceLoad = false;
     var retryLoad = false;
+    var PLAYED_SEC = 1;
+    var playedSec = 0;
+    var lastPos = null;
+    var progressTimer = null;
+    var loadPending = false;
     var shakaVer = '';
     var shakaProbe = 'not-probed';
     function readShakaVer() {
@@ -296,6 +301,24 @@
       if (errorHold) { try { clearTimeout(errorHold); } catch (e) {} errorHold = null; }
       heldError = null;
     }
+    function stopProgress() {
+      if (progressTimer) { try { clearTimeout(progressTimer); } catch (e) {} progressTimer = null; }
+    }
+    function watchProgress() {
+      if (playedSinceLoad || progressTimer) return;
+      var t = null;
+      try { t = pm.getCurrentTimeSec(); } catch (e) {}
+      if (typeof t === 'number' && isFinite(t)) {
+        if (lastPos !== null && t > lastPos && t - lastPos <= 2) playedSec += t - lastPos;
+        lastPos = t;
+      }
+      if (playedSec >= PLAYED_SEC) {
+        playedSinceLoad = true;
+        if (heldError || inError) { inError = false; clearHeldError(); showScreen('none'); }
+        return;
+      }
+      progressTimer = setTimeout(function () { progressTimer = null; watchProgress(); }, 500);
+    }
     function showError(code) {
       clearHeldError();
       inError = true;
@@ -310,13 +333,18 @@
     pm.setMessageInterceptor(M.MessageType.LOAD, function (req) {
       inError = false;
       retryLoad = !!heldError;
+      loadPending = true;
       playedSinceLoad = false;
+      playedSec = 0;
+      lastPos = null;
+      stopProgress();
       clearHeldError();
       showScreen('loading');
       if (loadWatchdog) { try { clearTimeout(loadWatchdog); } catch (e) {} }
       loadWatchdog = setTimeout(function () {
         loadWatchdog = null;
         if (heldError) return;
+        loadPending = false;
         dlog('LOAD watchdog: 60s on the loading screen with no state change → idle');
         showScreen('idle');
       }, 60000);
@@ -348,16 +376,27 @@
         }
       } catch (e) { dlog('ERR shaka re-probe: ' + (e && e.message || e)); }
     }, 'PLAYER_LOAD_COMPLETE');
-    on(pm, E.MEDIA_STATUS, function () {
+    on(pm, E.MEDIA_STATUS, function (ev) {
       var st = ''; try { st = pm.getPlayerState(); } catch (e) {}
-      if (st === 'PLAYING' || st === 'PAUSED') { inError = false; playedSinceLoad = true; clearHeldError(); showScreen('none'); }
-      else if (st === 'IDLE') { if (!inError && !heldError) showScreen('idle'); }
+      if (st === 'PLAYING' || st === 'PAUSED') {
+        loadPending = false;
+        inError = false; clearHeldError(); showScreen('none');
+        if (st === 'PLAYING') watchProgress();
+      }
+      else if (st === 'IDLE') {
+        stopProgress();
+        var why = ''; try { why = (ev && ev.mediaStatus && ev.mediaStatus.idleReason) || ''; } catch (e) {}
+        if (loadPending && why !== 'CANCELLED') return;
+        loadPending = false;
+        if (!inError && !heldError) showScreen('idle');
+      }
     }, 'MEDIA_STATUS');
-    on(pm, E.MEDIA_FINISHED, function () { dlog('MEDIA_FINISHED'); if (!inError && !heldError) showScreen('idle'); }, 'MEDIA_FINISHED');
+    on(pm, E.MEDIA_FINISHED, function () { dlog('MEDIA_FINISHED'); stopProgress(); if (!inError && !heldError) showScreen('idle'); }, 'MEDIA_FINISHED');
     on(pm, E.ERROR, function (e) {
       var code = e.detailedErrorCode;
       dlog('ERROR code=' + code + ' reason=' + (e.error && (e.error.reason || e.error.type) || '?'));
       if (code === 904) return;
+      loadPending = false;
       toSenders({ type: 'error', detailedErrorCode: code, reason: e.error && (e.error.reason || e.error.type) });
       if (playedSinceLoad || retryLoad) { showError(code); return; }
       clearHeldError();
